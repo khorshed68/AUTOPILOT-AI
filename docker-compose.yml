@@ -1,0 +1,92 @@
+name: autopilot-ai
+
+x-backend: &backend
+  build: ./backend
+  env_file: .env
+  environment: &backend-env
+    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-autopilot}:${POSTGRES_PASSWORD:?Run scripts/generate_env.py first}@postgres:5432/${POSTGRES_DB:-autopilot}
+    REDIS_URL: redis://redis:6379/0
+    UPLOAD_DIR: /data/uploads
+  volumes:
+    - uploads:/data/uploads
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-autopilot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run scripts/generate_env.py first}
+      POSTGRES_DB: ${POSTGRES_DB:-autopilot}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-55440}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-56390}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    <<: *backend
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  backend:
+    <<: *backend
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8100}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/api/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  worker:
+    <<: *backend
+    command: ["celery", "-A", "app.workers.celery_app:celery", "worker", "--loglevel=INFO", "--concurrency=2"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  beat:
+    <<: *backend
+    command: ["celery", "-A", "app.workers.celery_app:celery", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat-schedule"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-5190}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  uploads:
